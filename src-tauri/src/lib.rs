@@ -76,8 +76,10 @@ pub fn run() {
                         }
                     }
                     tauri::WindowEvent::Resized(_) => {
-                        // frontend re-measures #player-host and calls
-                        // player_set_bounds; nothing native to do here.
+                        // Tell the frontend to re-measure #player-host and call
+                        // player_set_bounds again (physical px may have changed).
+                        use tauri::Emitter;
+                        let _ = handle.emit("player://resize", ());
                     }
                     _ => {}
                 });

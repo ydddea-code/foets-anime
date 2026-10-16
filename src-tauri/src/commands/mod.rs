@@ -338,7 +338,16 @@ pub async fn player_init(
             let win = app
                 .get_webview_window("main")
                 .ok_or_else(|| AppError::PlayerUnavailable("main window missing".into()))?;
+            // Resolve the real native frame HWND and read its current client
+            // rect so the child render window starts at sane coordinates.
+            let (cx, cy, cw, ch) = embed.frame_client_rect()?;
             embed.set_parent_from_window(&win)?;
+            state.player.init(0)?;
+            crate::player::windows::set_player_bounds(embed, 0, 0, cw as i32, ch as i32)?;
+            // The frontend immediately follows up with player_set_bounds using
+            // the measured #player-host rect; this is just a safe fallback.
+            let _ = (cx, cy);
+            return Ok(());
         }
     }
     state.player.init(0)
@@ -538,11 +547,7 @@ pub async fn set_setting(
     key: String,
     value: String,
 ) -> AppResult<()> {
-    const ALLOWED: &[&str] = &[
-        "theme", "history_enabled", "auto_thumbnail", "subtitle_lang", "audio_lang",
-        "default_speed", "default_volume", "keep_awake",
-    ];
-    if !ALLOWED.contains(&key.as_str()) {
+    if !crate::settings::is_allowed_key(&key) {
         return Err(AppError::InvalidInput(format!("unknown setting key: {key}")));
     }
     if value.len() > 200 {

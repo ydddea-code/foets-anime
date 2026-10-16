@@ -114,8 +114,10 @@ impl LibMpv {
         }
         let mut module: HMODULE = std::ptr::null_mut();
         for c in &candidates {
-            module = unsafe { LoadLibraryExW(wide(c).as_ptr(), NULL, 0) };
+            // LOAD_WITH_ALTERED_SEARCH_PATH so dependencies next to the DLL resolve.
+            module = unsafe { LoadLibraryExW(wide(c).as_ptr(), NULL, 0x00000008) };
             if !module.is_null() {
+                log::info!("loaded libmpv from {:?}", c);
                 break;
             }
         }
@@ -276,6 +278,39 @@ impl MpvEmbed {
         let target = if parent.is_null() { raw as HWND } else { parent };
         self.parent_hwnd.store(target as i64, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Current client rect of the native frame window (x, y, width, height in
+    /// physical pixels). Used to give the child render window a sane initial
+    /// size before the frontend reports the #player-host rect.
+    pub fn frame_client_rect(&self) -> AppResult<(i32, i32, i32, i32)> {
+        let parent = self.parent_hwnd.load(Ordering::SeqCst) as HWND;
+        if parent.is_null() {
+            return Err(AppError::PlayerUnavailable("main window handle unavailable".into()));
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            fn ClientToScreen(hWnd: HWND, lpPoint: *mut RECT);
+        }
+        unsafe {
+            let mut rc = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if GetClientRect(parent, &mut rc) == 0 {
+                return Err(AppError::PlayerUnavailable("GetClientRect failed".into()));
+            }
+            let mut pt = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            ClientToScreen(parent, &mut pt);
+            Ok((pt.left, pt.top, rc.right.max(1), rc.bottom.max(1)))
+        }
     }
 
     fn request<T>(&self, make: impl FnOnce(Sender<AppResult<T>>) -> Job) -> AppResult<T>
@@ -713,10 +748,15 @@ fn init_session(parent: HWND) -> AppResult<Session> {
         (lib.set_option)(mpv, b"osc\0".as_ptr(), b"no\0".as_ptr());
         (lib.set_option)(mpv, b"load-scripts\0".as_ptr(), b"no\0".as_ptr());
         (lib.set_option)(mpv, b"input-default-bindings\0".as_ptr(), b"no\0".as_ptr());
+        (lib.set_option)(mpv, b"input-vo-keyboard\0".as_ptr(), b"no\0".as_ptr());
         (lib.set_option)(mpv, b"keep-open\0".as_ptr(), b"yes\0".as_ptr());
         // hwdec auto-safe: hardware when whitelisted/safe, software fallback otherwise.
         (lib.set_option)(mpv, b"hwdec\0".as_ptr(), b"auto-safe\0".as_ptr());
         (lib.set_option)(mpv, b"gpu-context\0".as_ptr(), b"win\0".as_ptr());
+        // Keep memory footprint modest on weak machines (entry-level laptops).
+        (lib.set_option)(mpv, b"demuxer-max-bytes\0".as_ptr(), b"150MiB\0".as_ptr());
+        (lib.set_option)(mpv, b"demuxer-max-back-bytes\0".as_ptr(), b"50MiB\0".as_ptr());
+        (lib.set_option)(mpv, b"cache\0".as_ptr(), b"yes\0".as_ptr());
 
         let initp = MpvOpenGLInitParams {
             get_proc_address: Some(gl_get_proc_address),

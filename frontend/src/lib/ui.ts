@@ -30,6 +30,7 @@ export function modal(opts: {
   confirmLabel?: string;
   danger?: boolean;
   input?: boolean;
+  value?: string;
   requireMatch?: string;
 }): Promise<ModalResult> {
   return new Promise((resolve) => {

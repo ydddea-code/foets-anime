@@ -89,7 +89,7 @@ impl Drop for ScanJob {
 static SCAN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Spawn a scan over the given anime folder ids. Emits `scan://progress`.
-pub fn spawn(app: tauri::AppHandle, db: Arc<Db>, anime_ids: Vec<i64>, force_full: bool) -> Arc<ScanJob> {
+pub fn spawn(app: tauri::AppHandle, db: Arc<Db>, data_dir: PathBuf, anime_ids: Vec<i64>, force_full: bool) -> Arc<ScanJob> {
     let cancel = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let job = Arc::new(ScanJob {
@@ -102,7 +102,7 @@ pub fn spawn(app: tauri::AppHandle, db: Arc<Db>, anime_ids: Vec<i64>, force_full
     let handle = std::thread::Builder::new()
         .name("fets-scanner".into())
         .spawn(move || {
-            run(db, anime_ids, force_full, &cancel, &done, &|p| emit(&app, p));
+            run_with_covers(db, anime_ids, force_full, &cancel, &done, &|p| emit(&app, p), &data_dir);
         })
         .expect("failed to spawn scanner thread");
     if let Ok(mut g) = job.join.lock() {
@@ -111,12 +111,37 @@ pub fn spawn(app: tauri::AppHandle, db: Arc<Db>, anime_ids: Vec<i64>, force_full
     job
 }
 
+/// Production entry: like `run` but with the app data dir so the optional
+/// auto-thumbnail feature can store generated covers.
+fn run_with_covers(
+    db: Arc<Db>,
+    anime_ids: Vec<i64>,
+    force_full: bool,
+    cancel: &AtomicBool,
+    done: &AtomicBool,
+    sink: &dyn Fn(&ScanProgress),
+    data_dir: &Path,
+) {
+    run_inner(db, anime_ids, force_full, cancel, done, sink, Some(data_dir))
+}
+
 fn emit(app: &tauri::AppHandle, p: &ScanProgress) {
     let _ = app.emit("scan://progress", p);
 }
 
 /// Core loop. Split out from `spawn` so tests can drive it without Tauri.
 pub fn run(
+    db: Arc<Db>,
+    anime_ids: Vec<i64>,
+    force_full: bool,
+    cancel: &AtomicBool,
+    done: &AtomicBool,
+    sink: &dyn Fn(&ScanProgress),
+) {
+    run_inner(db, anime_ids, force_full, cancel, done, sink, None)
+}
+
+fn run_inner(
     db: Arc<Db>,
     anime_ids: Vec<i64>,
     force_full: bool,
@@ -364,6 +389,63 @@ pub fn probe_container(path: &Path, size: i64) -> Option<(Option<f64>, Option<i6
         "mp4" | "m4v" | "mov" => mp4::parse(path),
         _ => None,
     }
+}
+
+/// Optional, opt-in cover extraction for a freshly discovered video.
+/// Never runs unless the user enabled `auto_thumbnail` in Settings.
+/// Strategy (documented limitation): without FFmpeg we cannot decode an
+/// arbitrary frame; embedded cover art is only present in some containers,
+/// so this stays best-effort and silently skipped on failure.
+pub fn maybe_auto_cover(
+    db: &Arc<Db>,
+    covers_dir: &Path,
+    anime_id: i64,
+    path: &Path,
+) {
+    let enabled = match db.lock() {
+        Ok(c) => repo::get_setting(&c, "auto_thumbnail")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false),
+        Err(_) => return,
+    };
+    if !enabled {
+        return;
+    }
+    // Embedded pictures in MP4 ('covr' box) are rare; try MKV/MP4 attachment
+    // extraction via our container probes would be complex — instead use a
+    // generated placeholder unique per anime only when nothing exists yet.
+    let have_custom = db
+        .lock()
+        .ok()
+        .and_then(|c| repo::get_anime(&c, anime_id).ok())
+        .map(|a| a.cover_url.is_some())
+        .unwrap_or(true);
+    if have_custom {
+        return;
+    }
+    if let Some(img) = find_sidecar_image(path) {
+        if let Ok(dest) = crate::library::covers::make_thumbnail(&img, covers_dir, &format!("auto-{anime_id}")) {
+            if let Ok(c) = db.lock() {
+                let _ = repo::set_custom_cover(&c, anime_id, Some(&dest.to_string_lossy()));
+            }
+        }
+    }
+}
+
+fn find_sidecar_image(video: &Path) -> Option<PathBuf> {
+    let dir = video.parent()?;
+    let stem = video.file_stem()?.to_string_lossy().to_lowercase();
+    for ext in ["jpg", "jpeg", "png", "webp"] {
+        for cand in [format!("{stem}.{ext}"), "cover.jpg".into(), "folder.jpg".into()] {
+            let p = dir.join(&cand);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 mod mkv {
